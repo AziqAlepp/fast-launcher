@@ -1,7 +1,6 @@
 name: Build FastLauncher APK
 
-# Single-file setup: upload only this file to .github/workflows/build.yml
-# Actions tab > Build FastLauncher APK > Run workflow > download the APK artifact.
+# Single-file setup: only this file is needed at .github/workflows/build.yml
 
 on:
   push:
@@ -35,6 +34,7 @@ jobs:
       - name: Add FastLauncher performance module
         run: |
           set -euo pipefail
+          echo "== top-level =="; ls; echo "== settings =="; cat settings.gradle* 2>/dev/null | head -40 || true
           mkdir -p "$(dirname 'fastlauncher_perf/build.gradle')"
           cat > 'fastlauncher_perf/build.gradle' <<'FL_EOF'
           apply plugin: 'com.android.library'
@@ -42,7 +42,7 @@ jobs:
           android {
               namespace 'com.fastlauncher.perf'
               compileSdkVersion 34
-              defaultConfig { minSdkVersion 24 }
+              defaultConfig { minSdkVersion 21 }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
                   targetCompatibility JavaVersion.VERSION_1_8
@@ -592,36 +592,43 @@ jobs:
               Tier(String id) { this.id = id; }
           }
           FL_EOF
+          # --- find the Android app module automatically ---
+          CANDS=$(grep -rlE "android\.application" --include=build.gradle --include=build.gradle.kts . 2>/dev/null | grep -vE '^\./build\.gradle(\.kts)?$' | grep -v fastlauncher_perf || true)
+          echo "App module candidates: $CANDS"
+          APP_FILE=$(echo "$CANDS" | grep -i pojav | head -n1 || true)
+          [ -n "$APP_FILE" ] || APP_FILE=$(echo "$CANDS" | head -n1 || true)
+          [ -n "$APP_FILE" ] || { echo "No Android app module found"; exit 1; }
+          APP_DIR=$(dirname "$APP_FILE" | sed 's|^\./||')
+          MODULE=":$(echo "$APP_DIR" | tr '/' ':')"
+          echo "Using app module: $MODULE ($APP_FILE)"
+          echo "APP_MODULE=$MODULE" >> "$GITHUB_ENV"
+
           # --- register module in settings ---
           found=0
-          for f in settings.gradle settings.gradle.kts; do
-            if [ -f "$f" ]; then
-              grep -q fastlauncher_perf "$f" || echo "include(':fastlauncher_perf')" >> "$f"
-              found=1
-            fi
-          done
+          if [ -f settings.gradle ]; then
+            grep -q fastlauncher_perf settings.gradle || printf "\ninclude ':fastlauncher_perf'\n" >> settings.gradle
+            found=1
+          fi
+          if [ -f settings.gradle.kts ]; then
+            grep -q fastlauncher_perf settings.gradle.kts || printf '\ninclude(":fastlauncher_perf")\n' >> settings.gradle.kts
+            found=1
+          fi
           [ "$found" = 1 ] || { echo "settings.gradle not found"; exit 1; }
 
-          # --- add dependency to app module ---
-          APP="app_pojavlauncher"
-          if [ -f "$APP/build.gradle" ]; then
-            sed -i '0,/^dependencies *{/s//dependencies {\n    implementation project(":fastlauncher_perf")/' "$APP/build.gradle"
-            grep -q fastlauncher_perf "$APP/build.gradle" || { echo "dependency injection failed"; exit 1; }
-          elif [ -f "$APP/build.gradle.kts" ]; then
-            sed -i '0,/^dependencies *{/s//dependencies {\n    implementation(project(":fastlauncher_perf"))/' "$APP/build.gradle.kts"
-            grep -q fastlauncher_perf "$APP/build.gradle.kts" || { echo "dependency injection failed"; exit 1; }
-          else
-            echo "$APP/build.gradle not found. Check the module name."; exit 1
-          fi
-          echo "Injected fastlauncher_perf"
+          # --- add dependency to the app module (appended block works in any layout) ---
+          case "$APP_FILE" in
+            *.kts) printf '\ndependencies {\n    implementation(project(":fastlauncher_perf"))\n}\n' >> "$APP_FILE" ;;
+            *)     printf '\ndependencies {\n    implementation project(":fastlauncher_perf")\n}\n' >> "$APP_FILE" ;;
+          esac
+          echo "Injected fastlauncher_perf into $APP_FILE"
 
       - name: Build debug APK
         run: |
           chmod +x gradlew
-          ./gradlew :app_pojavlauncher:assembleDebug --stacktrace
+          ./gradlew "${APP_MODULE}:assembleDebug" --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: FastLauncher-debug-apk
-          path: app_pojavlauncher/build/outputs/apk/debug/*.apk
+          path: "**/build/outputs/apk/debug/*.apk"
