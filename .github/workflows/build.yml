@@ -1,0 +1,624 @@
+name: Build FastLauncher APK
+
+# Single-file setup: upload only this file to .github/workflows/build.yml
+# Actions tab > Build FastLauncher APK > Run workflow > download the APK artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Base launcher repo (owner/name)
+        default: MojoLauncher/MojoLauncher
+      upstream_ref:
+        description: Branch or tag
+        default: main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base launcher
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.upstream_repo || 'MojoLauncher/MojoLauncher' }}
+          ref: ${{ inputs.upstream_ref || 'main' }}
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Add FastLauncher performance module
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname 'fastlauncher_perf/build.gradle')"
+          cat > 'fastlauncher_perf/build.gradle' <<'FL_EOF'
+          apply plugin: 'com.android.library'
+
+          android {
+              namespace 'com.fastlauncher.perf'
+              compileSdkVersion 34
+              defaultConfig { minSdkVersion 24 }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/AndroidManifest.xml')"
+          cat > 'fastlauncher_perf/src/main/AndroidManifest.xml' <<'FL_EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application>
+                  <!-- Runs on app start: applies recommended profile once, hooks FPS overlay -->
+                  <provider
+                      android:name="com.fastlauncher.perf.PerfInitProvider"
+                      android:authorities="${applicationId}.fastlauncher.perf"
+                      android:exported="false"
+                      android:initOrder="100" />
+                  <!-- Second icon "Optimize" opens the settings screen -->
+                  <activity
+                      android:name="com.fastlauncher.perf.PerfSettingsActivity"
+                      android:label="Optimize"
+                      android:exported="true"
+                      android:theme="@android:style/Theme.DeviceDefault">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/assets/presets/options_balanced.txt')"
+          cat > 'fastlauncher_perf/src/main/assets/presets/options_balanced.txt' <<'FL_EOF'
+          renderDistance:8
+          simulationDistance:6
+          graphicsMode:0
+          particles:1
+          ao:true
+          entityShadows:false
+          cloudRenderMode:"off"
+          biomeBlendRadius:1
+          mipmapLevels:2
+          entityDistanceScaling:0.75
+          maxFps:260
+          enableVsync:false
+          guiScale:2
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/assets/presets/options_low.txt')"
+          cat > 'fastlauncher_perf/src/main/assets/presets/options_low.txt' <<'FL_EOF'
+          renderDistance:5
+          simulationDistance:5
+          graphicsMode:0
+          particles:2
+          ao:false
+          entityShadows:false
+          cloudRenderMode:"off"
+          biomeBlendRadius:0
+          mipmapLevels:0
+          entityDistanceScaling:0.5
+          maxFps:260
+          enableVsync:false
+          bobView:false
+          guiScale:2
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/assets/presets/performance_profiles.json')"
+          cat > 'fastlauncher_perf/src/main/assets/presets/performance_profiles.json' <<'FL_EOF'
+          {
+            "version": 1,
+            "profiles": {
+              "potato": {
+                "minRamMb": 0,
+                "xmxMb": 1024,
+                "jvmArgs": ["-XX:+UseSerialGC","-XX:TieredStopAtLevel=1","-Xshare:auto","-XX:+DisableExplicitGC"],
+                "options": "options_low.txt",
+                "mods": ["modernfix","ferrite-core","entityculling"]
+              },
+              "balanced": {
+                "minRamMb": 4000,
+                "xmxMb": 1536,
+                "jvmArgs": ["-XX:+UseG1GC","-XX:MaxGCPauseMillis=50","-XX:+UnlockExperimentalVMOptions","-XX:G1NewSizePercent=30","-XX:+DisableExplicitGC","-Xshare:auto"],
+                "options": "options_balanced.txt",
+                "mods": ["lithium","modernfix","ferrite-core","entityculling","immediatelyfast"]
+              },
+              "max_fps": {
+                "minRamMb": 8000,
+                "xmxMb": 2560,
+                "jvmArgs": ["-XX:+UseG1GC","-XX:MaxGCPauseMillis=30","-XX:+UnlockExperimentalVMOptions","-XX:G1NewSizePercent=40","-XX:G1ReservePercent=15","-XX:+DisableExplicitGC","-XX:+AlwaysPreTouch","-Xshare:auto"],
+                "options": "options_balanced.txt",
+                "mods": ["lithium","modernfix","ferrite-core","entityculling","immediatelyfast","sodium"],
+                "note": "sodium needs OpenGL 3.2+: use only with Zink/ANGLE-class renderers, not gl4es"
+              }
+            }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/DeviceProfiler.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/DeviceProfiler.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.app.ActivityManager;
+          import android.content.Context;
+
+          public final class DeviceProfiler {
+              private DeviceProfiler() {}
+
+              public static long totalMb(Context c) {
+                  ActivityManager am = (ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
+                  ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
+                  am.getMemoryInfo(info);
+                  return info.totalMem / (1024 * 1024);
+              }
+
+              public static Tier recommend(Context c) {
+                  long mb = totalMb(c);
+                  if (mb >= 8000) return Tier.MAX_FPS;
+                  if (mb >= 4000) return Tier.BALANCED;
+                  return Tier.POTATO;
+              }
+
+              /** Never give the JVM more than ~40% of total RAM. */
+              public static int safeXmxMb(Context c, int wantedMb) {
+                  return Math.min(wantedMb, (int) (totalMb(c) * 0.4));
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/FpsHook.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/FpsHook.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.FrameLayout;
+
+          /** Adds the FPS overlay on top of the game activity (class named "MainActivity") when enabled. */
+          public class FpsHook implements Application.ActivityLifecycleCallbacks {
+              private static final String TAG = "fl_fps_overlay";
+
+              @Override public void onActivityResumed(Activity a) {
+                  if (!"MainActivity".equals(a.getClass().getSimpleName())) return;
+                  if (!ProfileManager.own(a).getBoolean("fps_overlay", false)) return;
+                  ViewGroup content = a.findViewById(android.R.id.content);
+                  if (content == null || content.findViewWithTag(TAG) != null) return;
+                  FpsOverlay o = new FpsOverlay(a);
+                  o.setTag(TAG);
+                  content.addView(o, new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.TOP | Gravity.START));
+              }
+
+              @Override public void onActivityPaused(Activity a) {
+                  ViewGroup content = a.findViewById(android.R.id.content);
+                  if (content == null) return;
+                  View v = content.findViewWithTag(TAG);
+                  if (v != null) content.removeView(v);
+              }
+
+              @Override public void onActivityCreated(Activity a, Bundle b) {}
+              @Override public void onActivityStarted(Activity a) {}
+              @Override public void onActivityStopped(Activity a) {}
+              @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+              @Override public void onActivityDestroyed(Activity a) {}
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/FpsOverlay.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/FpsOverlay.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.graphics.Color;
+          import android.os.BatteryManager;
+          import android.view.Choreographer;
+          import android.widget.TextView;
+
+          public class FpsOverlay extends TextView implements Choreographer.FrameCallback {
+              private int frames = 0;
+              private long last = System.nanoTime();
+
+              public FpsOverlay(Context c) {
+                  super(c);
+                  setTextColor(Color.GREEN);
+                  setTextSize(11f);
+                  setBackgroundColor(0x88000000);
+                  setPadding(10, 4, 10, 4);
+                  setText("FPS ...");
+              }
+
+              @Override protected void onAttachedToWindow() {
+                  super.onAttachedToWindow();
+                  Choreographer.getInstance().postFrameCallback(this);
+              }
+
+              @Override protected void onDetachedFromWindow() {
+                  Choreographer.getInstance().removeFrameCallback(this);
+                  super.onDetachedFromWindow();
+              }
+
+              @Override public void doFrame(long frameTimeNanos) {
+                  frames++;
+                  long now = System.nanoTime();
+                  if (now - last >= 1_000_000_000L) {
+                      Intent i = getContext().registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                      float temp = i == null ? 0f : i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10f;
+                      setText("FPS " + frames + " | " + temp + "\u00B0C");
+                      frames = 0;
+                      last = now;
+                  }
+                  Choreographer.getInstance().postFrameCallback(this);
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/ModInstaller.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/ModInstaller.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLEncoder;
+          import java.util.List;
+
+          /** Downloads the newest compatible build of each mod from Modrinth. Call off the main thread. */
+          public final class ModInstaller {
+              private ModInstaller() {}
+
+              public interface Log { void line(String s); }
+
+              private static final String API = "https://api.modrinth.com/v2";
+
+              public static void install(List<String> slugs, String mcVersion, String loader, File modsDir, Log log) {
+                  modsDir.mkdirs();
+                  for (String slug : slugs) {
+                      try {
+                          String gv = URLEncoder.encode("[\"" + mcVersion + "\"]", "UTF-8");
+                          String ld = URLEncoder.encode("[\"" + loader + "\"]", "UTF-8");
+                          JSONArray versions = new JSONArray(new String(
+                                  download(API + "/project/" + slug + "/version?game_versions=" + gv + "&loaders=" + ld), "UTF-8"));
+                          if (versions.length() == 0) { log.line(slug + ": no build for " + mcVersion + "/" + loader); continue; }
+                          JSONObject f = versions.getJSONObject(0).getJSONArray("files").getJSONObject(0);
+                          File out = new File(modsDir, f.getString("filename"));
+                          if (!out.exists()) {
+                              byte[] data = download(f.getString("url"));
+                              try (FileOutputStream os = new FileOutputStream(out)) { os.write(data); }
+                          }
+                          log.line(slug + ": OK");
+                      } catch (Exception e) {
+                          log.line(slug + ": failed (" + e.getMessage() + ")");
+                      }
+                  }
+              }
+
+              private static byte[] download(String u) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                  c.setRequestProperty("User-Agent", "FastLauncher/1.0");
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(30000);
+                  try (InputStream in = c.getInputStream()) {
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                      return out.toByteArray();
+                  } finally { c.disconnect(); }
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/PerfInitProvider.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/PerfInitProvider.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.app.Application;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.net.Uri;
+
+          /** Auto-runs at app start (no code changes needed in the launcher). */
+          public class PerfInitProvider extends ContentProvider {
+              @Override public boolean onCreate() {
+                  Context c = getContext();
+                  if (c == null) return true;
+                  try {
+                      if (!ProfileManager.own(c).getBoolean("first_done", false)) {
+                          ProfileManager.applyToLauncher(c, DeviceProfiler.recommend(c), false);
+                          ProfileManager.own(c).edit().putBoolean("first_done", true).apply();
+                      }
+                  } catch (Exception ignored) {}
+                  Context app = c.getApplicationContext();
+                  if (app instanceof Application) {
+                      ((Application) app).registerActivityLifecycleCallbacks(new FpsHook());
+                  }
+                  return true;
+              }
+
+              @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
+              @Override public String getType(Uri u) { return null; }
+              @Override public Uri insert(Uri u, ContentValues v) { return null; }
+              @Override public int delete(Uri u, String s, String[] a) { return 0; }
+              @Override public int update(Uri u, ContentValues v, String s, String[] a) { return 0; }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/PerfSettingsActivity.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/PerfSettingsActivity.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.app.Activity;
+          import android.content.SharedPreferences;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.widget.*;
+          import java.io.File;
+
+          public class PerfSettingsActivity extends Activity {
+              @Override protected void onCreate(Bundle s) {
+                  super.onCreate(s);
+                  final SharedPreferences own = ProfileManager.own(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(40, 40, 40, 40);
+
+                  Tier rec = DeviceProfiler.recommend(this);
+                  TextView info = new TextView(this);
+                  info.setText("RAM: " + DeviceProfiler.totalMb(this) + " MB\nGPU: " + RendererSelector.detectGpu()
+                          + "\nRecommended: " + rec.id + "\nRenderer suggestion: " + RendererSelector.recommend(rec));
+                  root.addView(info);
+
+                  final RadioGroup group = new RadioGroup(this);
+                  for (Tier t : Tier.values()) {
+                      RadioButton rb = new RadioButton(this);
+                      rb.setText(t.id);
+                      rb.setTag(t);
+                      rb.setId(View.generateViewId());
+                      rb.setChecked(t == rec);
+                      group.addView(rb);
+                  }
+                  root.addView(group);
+
+                  final EditText version = new EditText(this);
+                  version.setHint("Minecraft version, e.g. 1.20.1");
+                  version.setText(own.getString("mc_version", "1.20.1"));
+                  root.addView(version);
+
+                  final EditText dir = new EditText(this);
+                  dir.setHint("Game directory");
+                  File guess = new File(getExternalFilesDir(null), ".minecraft");
+                  dir.setText(own.getString("game_dir", guess.getAbsolutePath()));
+                  root.addView(dir);
+
+                  final Spinner loader = new Spinner(this);
+                  loader.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                          new String[]{"fabric", "quilt", "forge", "neoforge"}));
+                  root.addView(loader);
+
+                  final CheckBox fps = new CheckBox(this);
+                  fps.setText("Show FPS overlay in game");
+                  fps.setChecked(own.getBoolean("fps_overlay", false));
+                  final CheckBox renderer = new CheckBox(this);
+                  renderer.setText("Apply suggested renderer (experimental)");
+                  final CheckBox opts = new CheckBox(this);
+                  opts.setText("Write options.txt (overwrites)");
+                  final CheckBox mods = new CheckBox(this);
+                  mods.setText("Install optimization mods");
+                  root.addView(fps); root.addView(renderer); root.addView(opts); root.addView(mods);
+
+                  final TextView log = new TextView(this);
+                  Button apply = new Button(this);
+                  apply.setText("Apply");
+                  apply.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          final Tier tier = (Tier) group.findViewById(group.getCheckedRadioButtonId()).getTag();
+                          final File gameDir = new File(dir.getText().toString().trim());
+                          final String mc = version.getText().toString().trim();
+                          final String ld = (String) loader.getSelectedItem();
+                          own.edit().putBoolean("fps_overlay", fps.isChecked())
+                                  .putString("mc_version", mc).putString("game_dir", gameDir.getAbsolutePath()).apply();
+                          try {
+                              ProfileManager.applyToLauncher(PerfSettingsActivity.this, tier, renderer.isChecked());
+                              log.setText("Applied " + tier.id + " (RAM + JVM args)\n");
+                              if (opts.isChecked()) {
+                                  ProfileManager.writeOptions(PerfSettingsActivity.this, tier, gameDir);
+                                  log.append("options.txt written\n");
+                              }
+                              if (mods.isChecked()) {
+                                  final java.util.List<String> slugs = ProfileManager.mods(PerfSettingsActivity.this, tier);
+                                  new Thread(new Runnable() {
+                                      @Override public void run() {
+                                          ModInstaller.install(slugs, mc, ld, new File(gameDir, "mods"), new ModInstaller.Log() {
+                                              @Override public void line(final String l) {
+                                                  runOnUiThread(new Runnable() {
+                                                      @Override public void run() { log.append(l + "\n"); }
+                                                  });
+                                              }
+                                          });
+                                      }
+                                  }).start();
+                              }
+                          } catch (Exception e) {
+                              log.setText("Error: " + e.getMessage());
+                          }
+                      }
+                  });
+                  root.addView(apply);
+                  root.addView(log);
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(root);
+                  setContentView(sv);
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/ProfileManager.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/ProfileManager.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public final class ProfileManager {
+              private ProfileManager() {}
+
+              public static final String PREFS = "fl_perf";
+
+              public static SharedPreferences own(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              /** The launcher's default SharedPreferences (Pojav-style keys: allocation, javaArgs, renderer). */
+              public static SharedPreferences launcher(Context c) {
+                  return c.getSharedPreferences(c.getPackageName() + "_preferences", Context.MODE_PRIVATE);
+              }
+
+              static String readAsset(Context c, String path) throws Exception {
+                  try (InputStream in = c.getAssets().open(path)) {
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096];
+                      int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                      return out.toString("UTF-8");
+                  }
+              }
+
+              public static JSONObject profile(Context c, Tier t) throws Exception {
+                  return new JSONObject(readAsset(c, "presets/performance_profiles.json"))
+                          .getJSONObject("profiles").getJSONObject(t.id);
+              }
+
+              public static List<String> mods(Context c, Tier t) throws Exception {
+                  JSONArray a = profile(c, t).getJSONArray("mods");
+                  List<String> l = new ArrayList<>();
+                  for (int i = 0; i < a.length(); i++) l.add(a.getString(i));
+                  return l;
+              }
+
+              /** Writes RAM + JVM args (and optionally renderer) into the launcher's preferences. */
+              public static void applyToLauncher(Context c, Tier t, boolean applyRenderer) throws Exception {
+                  JSONObject p = profile(c, t);
+                  JSONArray args = p.getJSONArray("jvmArgs");
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < args.length(); i++) {
+                      if (i > 0) sb.append(' ');
+                      sb.append(args.getString(i));
+                  }
+                  SharedPreferences.Editor e = launcher(c).edit();
+                  e.putInt("allocation", DeviceProfiler.safeXmxMb(c, p.getInt("xmxMb")));
+                  e.putString("javaArgs", sb.toString());
+                  if (applyRenderer) e.putString("renderer", RendererSelector.recommend(t));
+                  e.apply();
+              }
+
+              public static void writeOptions(Context c, Tier t, File gameDir) throws Exception {
+                  String file = profile(c, t).getString("options");
+                  gameDir.mkdirs();
+                  try (FileOutputStream out = new FileOutputStream(new File(gameDir, "options.txt"))) {
+                      out.write(readAsset(c, "presets/" + file).getBytes("UTF-8"));
+                  }
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/RendererSelector.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/RendererSelector.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          import android.os.Build;
+          import java.util.Locale;
+
+          /** Default renderer by GPU family. IDs follow Pojav-style forks; verify against your build. */
+          public final class RendererSelector {
+              private RendererSelector() {}
+
+              public static final String GL4ES = "opengles2";
+              public static final String ZINK = "vulkan_zink";
+              public static final String ANGLE = "opengles3_desktopgl_angle_vulkan";
+
+              public enum Gpu { ADRENO, MALI, XCLIPSE, POWERVR, UNKNOWN }
+
+              public static Gpu detectGpu() {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append(Build.HARDWARE).append(' ').append(Build.BOARD).append(' ').append(Build.MANUFACTURER);
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      sb.append(' ').append(Build.SOC_MANUFACTURER).append(' ').append(Build.SOC_MODEL);
+                  }
+                  String id = sb.toString().toLowerCase(Locale.ROOT);
+                  if (id.contains("qcom") || id.contains("qualcomm") || id.contains("snapdragon")
+                          || id.contains("sm8") || id.contains("sm7")) return Gpu.ADRENO;
+                  if (id.contains("exynos") || id.contains("s5e")) {
+                      return id.contains("s5e9") ? Gpu.XCLIPSE : Gpu.MALI;
+                  }
+                  if (id.contains("mt6") || id.contains("mediatek") || id.contains("kirin")
+                          || id.contains("tensor")) return Gpu.MALI;
+                  if (id.contains("powervr")) return Gpu.POWERVR;
+                  return Gpu.UNKNOWN;
+              }
+
+              public static String recommend(Tier tier) {
+                  switch (detectGpu()) {
+                      case ADRENO: return tier == Tier.POTATO ? GL4ES : ZINK;
+                      case XCLIPSE: return tier == Tier.MAX_FPS ? ANGLE : GL4ES;
+                      default: return GL4ES;
+                  }
+              }
+          }
+          FL_EOF
+          mkdir -p "$(dirname 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/Tier.java')"
+          cat > 'fastlauncher_perf/src/main/java/com/fastlauncher/perf/Tier.java' <<'FL_EOF'
+          package com.fastlauncher.perf;
+
+          public enum Tier {
+              POTATO("potato"), BALANCED("balanced"), MAX_FPS("max_fps");
+              public final String id;
+              Tier(String id) { this.id = id; }
+          }
+          FL_EOF
+          # --- register module in settings ---
+          found=0
+          for f in settings.gradle settings.gradle.kts; do
+            if [ -f "$f" ]; then
+              grep -q fastlauncher_perf "$f" || echo "include(':fastlauncher_perf')" >> "$f"
+              found=1
+            fi
+          done
+          [ "$found" = 1 ] || { echo "settings.gradle not found"; exit 1; }
+
+          # --- add dependency to app module ---
+          APP="app_pojavlauncher"
+          if [ -f "$APP/build.gradle" ]; then
+            sed -i '0,/^dependencies *{/s//dependencies {\n    implementation project(":fastlauncher_perf")/' "$APP/build.gradle"
+            grep -q fastlauncher_perf "$APP/build.gradle" || { echo "dependency injection failed"; exit 1; }
+          elif [ -f "$APP/build.gradle.kts" ]; then
+            sed -i '0,/^dependencies *{/s//dependencies {\n    implementation(project(":fastlauncher_perf"))/' "$APP/build.gradle.kts"
+            grep -q fastlauncher_perf "$APP/build.gradle.kts" || { echo "dependency injection failed"; exit 1; }
+          else
+            echo "$APP/build.gradle not found. Check the module name."; exit 1
+          fi
+          echo "Injected fastlauncher_perf"
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app_pojavlauncher:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastLauncher-debug-apk
+          path: app_pojavlauncher/build/outputs/apk/debug/*.apk
