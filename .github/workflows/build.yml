@@ -13,8 +13,8 @@ on:
         description: Base launcher repo (owner/name)
         default: MojoLauncher/MojoLauncher
       upstream_ref:
-        description: Branch or tag
-        default: main
+        description: Branch or tag (leave empty for the default branch)
+        default: ""
 
 jobs:
   build:
@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.upstream_repo || 'MojoLauncher/MojoLauncher' }}
-          ref: ${{ inputs.upstream_ref || 'main' }}
+          ref: ${{ inputs.upstream_ref }}
           submodules: recursive
 
       - uses: actions/setup-java@v4
