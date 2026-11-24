@@ -4,6 +4,9 @@ name: Build FastLauncher APK
 # Actions tab > Build FastLauncher APK > Run workflow > download the APK artifact.
 
 on:
+  push:
+    branches: ["**"]
+    paths: [".github/workflows/build.yml"]
   workflow_dispatch:
     inputs:
       upstream_repo:
